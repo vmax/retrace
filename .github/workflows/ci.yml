@@ -1,0 +1,47 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Run the test suite
+        run: uv run --python ${{ matrix.python-version }} --extra dev pytest -q
+        env:
+          # the suite must not see the runner's own transcripts, if it has any
+          RETRACE_NO_AUTO: "1"
+
+      - name: Check the CLI half does not import Textual
+        run: |
+          uv run --python ${{ matrix.python-version }} python - <<'PY'
+          import subprocess, sys
+          out = subprocess.run(
+              [sys.executable, "-c",
+               "from retrace import cli;"
+               "import sys;"
+               "print([m for m in sys.modules if m.split('.')[0] in "
+               "('textual','rich','markdown_it','pygments')])"],
+              capture_output=True, text=True, check=True)
+          assert out.stdout.strip() == "[]", out.stdout
+          PY
+
+      - name: Verify it installs as a tool and runs
+        run: |
+          uv tool install .
+          retrace --version
+          retrace stats
