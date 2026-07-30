@@ -11,7 +11,7 @@ import os
 import pytest
 
 from retrace import actions, query, sessions
-from retrace.tui.app import RetraceApp, highlight, run_app, short_project
+from retrace.tui.app import RetraceApp, highlight, message_style, run_app, short_project
 
 
 def text_of(widget) -> str:
@@ -231,6 +231,68 @@ async def test_preview_follows_the_selection(indexed):
         await pilot.press("down")
         await pilot.pause()
         assert "mikrotik" in text_of(app.query_one("#preview-content"))
+
+
+async def test_preview_collapses_and_expands_an_oversized_initial_prompt(db, env):
+    """Bootstrap prompts remain indexed, but do not bury the session preview."""
+    from retrace import indexer
+    from conftest import claude_msg, jsonl
+
+    prompt = ("The following is the Codex agent history whose request action you are "
+              "assessing.\n\n# AGENTS.md instructions for /work/preview\n"
+              "BOOTSTRAP-MARKER")
+    jsonl(env["claude"] / "-work-preview" / "preview.jsonl", [
+        claude_msg("user", prompt, session="preview-session",
+                   ts="2026-07-01T10:00:00Z", cwd="/work/preview"),
+        claude_msg("assistant", "bootstrap response", session="preview-session",
+                   ts="2026-07-01T10:00:01Z", cwd="/work/preview"),
+        claude_msg("user", "first real task", session="preview-session",
+                   ts="2026-07-01T10:01:00Z", cwd="/work/preview"),
+        claude_msg("assistant", "actual useful response", session="preview-session",
+                   ts="2026-07-01T10:01:01Z", cwd="/work/preview"),
+    ])
+    indexer.index(db)
+
+    app = app_for(db)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        preview = text_of(app.query_one("#preview-content"))
+        session = next(iter(app.rows.values()))
+        assert session["has_collapsed_initial"]
+        assert session["title"] == "first real task"
+        assert "2 initial messages collapsed" in preview
+        assert "BOOTSTRAP-MARKER" not in preview
+        assert "bootstrap response" not in preview
+        assert "first real task" in preview
+        assert "actual useful response" in preview
+
+        await pilot.press("alt+e")
+        await pilot.pause()
+        preview = text_of(app.query_one("#preview-content"))
+        assert "initial messages collapsed" not in preview
+        assert "BOOTSTRAP-MARKER" in preview
+
+
+def test_oversized_initial_prompt_is_a_bootstrap_prefix():
+    messages = [
+        ("developer", "", 1, "agent context"),
+        ("user", "", 2, "x" * 2_000),
+        ("assistant", "", 3, "setup response"),
+        ("user", "", 4, "The following is the Codex agent history whose request "
+         "action you are assessing."),
+        ("assistant", "", 5, "assessment response"),
+        ("user", "", 6, "first real task"),
+    ]
+    assert RetraceApp._initial_prompt_end(messages) == 5
+
+
+def test_preview_markers_and_message_colours():
+    title = RetraceApp._session_title(
+        {"has_collapsed_initial": True, "label": None, "title": "task"}
+    )
+    assert str(title) == "… task"
+    assert message_style("user/sub") == "cyan"
+    assert message_style("assistant") == "green"
 
 
 async def test_message_preview_marks_the_hit(indexed):

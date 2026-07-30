@@ -57,6 +57,18 @@ def test_clean_title_rejects_wrappers():
     assert query.clean_title("  keep   this ") == "keep this"
 
 
+def test_skill_preamble_is_initial_bootstrap_text():
+    assert query.is_initial_bootstrap_text(
+        "Base directory for this skill: /Users/me/.claude/skills/example\n\n# Example"
+    )
+
+
+def test_known_bootstrap_preamble_is_not_limited_to_the_first_user_turn():
+    assert query.is_known_bootstrap_preamble(
+        "The following is the Codex agent history added since your last approval"
+    )
+
+
 def test_titles_use_one_query(indexed):
     seen = []
     indexed.set_trace_callback(lambda s: seen.append(s))

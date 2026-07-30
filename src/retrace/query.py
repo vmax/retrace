@@ -24,6 +24,25 @@ OPS = re.compile(r'"|\bAND\b|\bOR\b|\bNOT\b|\bNEAR\s*\(|\^|:')
 
 ROLE_CYCLE = ("all", "user", "assistant")
 
+# Bootstrap prompts from skills and agent launchers can be several screens long.
+# Codex can also inject this shorter handoff preamble before the conversation.
+BOOTSTRAP_PREAMBLES = (
+    "The following is the Codex agent history",
+    "Base directory for this skill:",
+)
+
+
+def is_initial_bootstrap_text(text: str | None) -> bool:
+    """Whether first-user text is preview boilerplate rather than a request."""
+    text = text or ""
+    return len(text) >= 2_000 \
+        or is_known_bootstrap_preamble(text)
+
+
+def is_known_bootstrap_preamble(text: str | None) -> bool:
+    """Known injected preambles, safe to skip repeatedly at session start."""
+    return (text or "").lstrip().startswith(BOOTSTRAP_PREAMBLES)
+
 
 def prep_query(q: str, prefix: bool = False) -> str:
     """Turn user input into a valid FTS5 MATCH expression.
@@ -213,7 +232,7 @@ def session_rows(
     if not base:
         return []
 
-    titles = _titles(db, [r[1] for r in base])
+    titles, bootstrap_sessions = _titles(db, [r[1] for r in base])
     out = []
     for src, sess, proj, path, lo, hi, n, label, first_id, cli_name in base:
         out.append({
@@ -221,6 +240,9 @@ def session_rows(
             "first": lo, "last": hi, "n": n, "label": label,
             "cli_name": cli_name, "first_id": first_id,
             "title": label or cli_name or titles.get(sess) or "(no user text)",
+            # Keep the list marker a single query rather than inspecting every
+            # session individually while a user moves through the browser.
+            "has_collapsed_initial": sess in bootstrap_sessions,
         })
     return out
 
@@ -231,8 +253,8 @@ def session_rows(
 _TITLE_BIND_MAX = 400
 
 
-def _titles(db: sqlite3.Connection, sessions: list[str]) -> dict[str, str]:
-    """First user message per session that is not a wrapper, in one query."""
+def _titles(db: sqlite3.Connection, sessions: list[str]) -> tuple[dict[str, str], set[str]]:
+    """First real user title plus sessions whose setup prefix is collapsible."""
     want = set(sessions)
     if len(want) <= _TITLE_BIND_MAX:
         marks = ",".join("?" * len(want))
@@ -240,6 +262,7 @@ def _titles(db: sqlite3.Connection, sessions: list[str]) -> dict[str, str]:
     else:
         cond, params = "", []
     titles: dict[str, str] = {}
+    bootstrap_sessions: set[str] = set()
     for sess, text in db.execute(
         "SELECT session, text FROM (SELECT session, text, "
         "row_number() OVER (PARTITION BY session ORDER BY id) rn FROM msgs "
@@ -249,9 +272,19 @@ def _titles(db: sqlite3.Connection, sessions: list[str]) -> dict[str, str]:
         if sess in titles or sess not in want:
             continue
         t = clean_title(text)
-        if t:
-            titles[sess] = t
-    return titles
+        if not t:
+            continue
+        if sess not in bootstrap_sessions:
+            if is_initial_bootstrap_text(t):
+                bootstrap_sessions.add(sess)
+                continue
+        elif is_known_bootstrap_preamble(t):
+            continue
+        titles[sess] = t
+    # A setup-only session should not put its full preamble in the list either.
+    for sess in bootstrap_sessions:
+        titles.setdefault(sess, "(initial prompt collapsed)")
+    return titles, bootstrap_sessions
 
 
 # ----------------------------------------------------------------- picker feed

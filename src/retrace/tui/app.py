@@ -58,6 +58,8 @@ HELP = """\
   alt+a/c/x       source: all / claude / codex
   alt+u           cycle role: any → user → assistant
   alt+d           flip newest ⇄ oldest
+  alt+e           show/hide a collapsed initial prompt in the preview
+  … title         session starts with a collapsed setup section
 
 [b]What is indexed[/b]
   User and assistant text only. Tool calls and results are excluded by default
@@ -116,6 +118,7 @@ class RetraceApp(App):
         Binding("alt+x", "source('codex')", "codex", show=False),
         Binding("alt+u", "cycle_role", "role", show=False),
         Binding("alt+d", "flip_sort", "order", show=False),
+        Binding("alt+e", "toggle_initial_prompt", "initial prompt", show=False),
         # f1, not "?": "?" is a character someone may want to search for, and the
         # search box has focus by default
         Binding("f1,question_mark", "help", "keys"),
@@ -153,6 +156,9 @@ class RetraceApp(App):
         self._truncated = False
         self._by_name = False
         self._named = 0
+        # Presentation state only: opening a bootstrap prompt must not mutate
+        # the transcript or leak into another invocation of the browser.
+        self.expanded_initial_prompts: set[str] = set()
 
     # ------------------------------------------------------------------ layout
 
@@ -234,6 +240,22 @@ class RetraceApp(App):
             self.project_exact = False
         self.refresh_rows()
 
+    def action_toggle_initial_prompt(self) -> None:
+        """Show or hide the selected session's oversized bootstrap prompt."""
+        row = self.current_session()
+        if row is None:
+            self.notify("select a session to toggle its initial prompt")
+            return
+        messages = sessions.messages(self.db, row["session"])
+        if self._initial_prompt_end(messages) is None:
+            self.notify("this session has no collapsed initial prompt")
+            return
+        if row["session"] in self.expanded_initial_prompts:
+            self.expanded_initial_prompts.remove(row["session"])
+        else:
+            self.expanded_initial_prompts.add(row["session"])
+        self.update_preview()
+
     def action_help(self) -> None:
         self.push_screen(TextScreen("retrace keys", HELP))
 
@@ -297,9 +319,20 @@ class RetraceApp(App):
             table.add_row(
                 (r["last"] or "")[:10], r["source"][:6], str(r["n"]),
                 short_project(r["project"]),
-                Text(("* " if r["label"] else "") + r["title"]),
+                self._session_title(r),
                 key=key,
             )
+
+    @staticmethod
+    def _session_title(row: dict) -> Text:
+        """A compact, visible marker for previews with hidden bootstrap text."""
+        title = Text()
+        if row.get("has_collapsed_initial"):
+            title.append("… ", style="dim")
+        if row["label"]:
+            title.append("* ")
+        title.append(row["title"])
+        return title
 
     def _fill_messages(self, table: DataTable) -> None:
         rows = query.message_feed(
@@ -440,16 +473,65 @@ class RetraceApp(App):
         return out
 
     def _preview_session(self, row: dict) -> Text:
+        all_messages = sessions.messages(self.db, row["session"])
+        collapsed_end = self._initial_prompt_end(all_messages)
+        is_expanded = row["session"] in self.expanded_initial_prompts
+        title = row["title"]
+        # The default title is the first user message. Do not let that one line
+        # defeat the collapse, while preserving explicit retrace/CLI names.
+        if collapsed_end is not None and not is_expanded \
+                and title == query.clean_title(all_messages[0][3]):
+            title = "(initial prompt collapsed)"
         out = Text()
-        out.append(f"{row['title']}\n", style="bold")
+        out.append(f"{title}\n", style="bold")
         out.append(f"{row['source']}  {row['session']}\n{row['project'] or '-'}\n"
                    f"{(row['first'] or '')[:19]} .. {(row['last'] or '')[:19]}  "
                    f"{row['n']} messages\n\n", style="dim")
-        for role, ts, _line, text in sessions.messages(self.db, row["session"])[:12]:
-            out.append(f"{role} ", style="bold")
+        if collapsed_end is not None and not is_expanded:
+            collapsed_chars = sum(len(message[3] or "")
+                                  for message in all_messages[:collapsed_end])
+            out.append(f"{collapsed_end} initial messages collapsed · "
+                       f"{collapsed_chars:,} chars · alt+e to expand\n\n", style="dim")
+        messages = all_messages if is_expanded or collapsed_end is None \
+            else all_messages[collapsed_end:]
+        for role, ts, _line, text in messages[:12]:
+            style = message_style(role)
+            out.append(f"{role} ", style=f"bold {style}")
             out.append(f"{(ts or '')[:19]}\n", style="dim")
-            out.append(text[:1200].strip() + "\n\n")
+            out.append(text[:1200].strip() + "\n\n", style=style)
         return out
+
+    @staticmethod
+    def _initial_prompt_end(messages: list[tuple]) -> int | None:
+        """Return the bootstrap prefix ending before the first real request.
+
+        Collapsing later long requests would conceal the conversation's useful
+        work. Restricting this to the first substantive user turn also avoids
+        trying to recognise fragile, CLI-specific skill or agent wrapper formats.
+        Once that turn is known to be bootstrap, hide its setup response(s) as well:
+        the next substantive user turn is where someone resumes reading.
+        """
+        bootstrap_at = None
+        for i, (role, _ts, _line, text) in enumerate(messages):
+            if str(role).split("/", 1)[0] != "user" or not query.clean_title(text):
+                continue
+            if query.is_initial_bootstrap_text(text):
+                bootstrap_at = i
+            break
+        if bootstrap_at is None:
+            return None
+        last_bootstrap = bootstrap_at
+        for i, (later_role, _ts, _line, later_text) in enumerate(
+                messages[bootstrap_at + 1:], bootstrap_at + 1):
+            if str(later_role).split("/", 1)[0] != "user" \
+                    or not query.clean_title(later_text):
+                continue
+            if query.is_known_bootstrap_preamble(later_text):
+                last_bootstrap = i
+                continue
+            return i
+        # Repeated injected handoffs are one setup section, not a conversation.
+        return len(messages) if last_bootstrap > bootstrap_at else bootstrap_at + 1
 
     def _preview_message(self, row: dict) -> Text:
         head, ctx = sessions.context_around(self.db, row["id"])
@@ -460,9 +542,10 @@ class RetraceApp(App):
         out.append(f"{head['project']}\n{head['path']}:{head['line']}\n\n", style="dim")
         for role, ts, line, text in ctx:
             marker = ">>> " if line == head["line"] else "    "
-            out.append(marker + str(role), style="bold" if marker[0] == ">" else "dim")
+            style = message_style(role)
+            out.append(marker + str(role), style=f"bold {style}")
             out.append(f" {(ts or '')[:19]}\n", style="dim")
-            out.append(text[:2500].strip() + "\n\n")
+            out.append(text[:2500].strip() + "\n\n", style=style)
         return out
 
     # ----------------------------------------------------------------- actions
@@ -613,6 +696,16 @@ class RetraceApp(App):
 # ----------------------------------------------------------------------- helpers
 
 SEP = " · "
+
+
+def message_style(role: str | None) -> str:
+    """Keep the two conversational voices legible in long previews."""
+    primary = str(role or "").split("/", 1)[0]
+    if primary == "user":
+        return "cyan"
+    if primary == "assistant":
+        return "green"
+    return "dim"
 
 
 def fit(parts: list[str], width: int) -> str:
